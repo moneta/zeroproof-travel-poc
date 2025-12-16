@@ -1,0 +1,54 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# SP1 circuits and proofs
+.sp1/
+*.bin
+*.proof
+
+# Logs
+*.log
+/tmp/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/agent-b/target/
+/agent-a/target/
+/zk-attestation-service/target/
+/sp1-verifier-deploy/lib/
+/sp1-verifier-deploy/out/
+/sp1-verifier-deploy/cache/
+/sp1-verifier-deploy/broadcast/
+/sp1-verifier-deploy/.git/
+/zk-attestation-service/lib/
+/zk-attestation-service/out/
+/zk-attestation-service/cache/
+/zk-attestation-service/broadcast/
+*.tar.gz
+
+# ELF binaries
+*.elf
+elf-compilation/
+
+# Docker
+.dockerignore
+
+# Node (if any)
+node_modules/

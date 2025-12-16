@@ -1,0 +1,13 @@
+[package]
+name = "agent-b-program"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "agent-b-program"
+path = "src/lib.rs"
+
+[dependencies]
+sp1-zkvm = { workspace = true }
+
+pricing-core = { path = "../pricing-core" }

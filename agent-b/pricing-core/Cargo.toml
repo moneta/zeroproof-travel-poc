@@ -1,0 +1,11 @@
+[package]
+name = "pricing-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+
+# Must compile for both host and riscv32im-succinct-zkvm-elf
+[features]
+default = []
