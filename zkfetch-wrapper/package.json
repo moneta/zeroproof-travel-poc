@@ -11,7 +11,6 @@
     "test:httpbin": "node tests/test-httpbin-origin.js",
     "test:onchain": "node tests/test-onchain-quick.js",
     "test:onchain:full": "node tests/test-onchain.js",
-    "test:onchain:full": "node tests/test-onchain.js",
     "test:selective": "node tests/test-selective-disclosure.js"
   },
   "dependencies": {
