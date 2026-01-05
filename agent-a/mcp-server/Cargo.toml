@@ -1,0 +1,41 @@
+[package]
+name = "agent-a-mcp-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agent-a-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP and async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization and validation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "0.8"
+
+# HTTP and crypto
+reqwest = { version = "0.12", features = ["json"] }
+ethers = { version = "2.0", features = ["abigen"] }
+hex = "0.4"
+sha2 = "0.10"
+
+# Web server
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Protocol types (shared)
+zk-protocol = { path = "../../zk-protocol" }
+
+[lib]
+name = "agent_a_mcp"
+path = "src/lib.rs"
