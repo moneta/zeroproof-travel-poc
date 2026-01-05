@@ -95,18 +95,36 @@ async fn fetch_tool_definitions(
     Ok(tools)
 }
 
-/// Fetch and merge tool definitions from Agent A and Payment Agent
+/// Fetch and merge tool definitions from Agent A Server and Agent B MCP Server
 async fn fetch_all_tools(
     client: &reqwest::Client,
     agent_a_url: &str,
+    agent_b_url: &str,
     payment_agent_url: Option<&str>,
 ) -> Result<Value> {
     // Fetch Agent A tools
     let mut all_tools: Vec<Value> = Vec::new();
     
-    let agent_a_response = fetch_tool_definitions(client, agent_a_url).await?;
-    if let Some(tools) = agent_a_response.get("tools").and_then(|t| t.as_array()) {
-        all_tools.extend(tools.clone());
+    let agent_a_response = fetch_tool_definitions(client, agent_a_url).await;
+    if let Ok(resp) = agent_a_response {
+        if let Some(tools) = resp.get("tools").and_then(|t| t.as_array()) {
+            all_tools.extend(tools.clone());
+            println!("  [Agent A Server] Loaded {} tools", tools.len());
+        }
+    }
+    
+    // Fetch Agent B MCP Server tools
+    match fetch_tool_definitions(client, agent_b_url).await {
+        Ok(response) => {
+            if let Some(tools) = response.get("tools").and_then(|t| t.as_array()) {
+                all_tools.extend(tools.clone());
+                println!("  [Agent B MCP Server] Loaded {} pricing/booking tools", tools.len());
+            }
+        }
+        Err(e) => {
+            println!("  ⚠️  Agent B MCP Server unavailable: {}", e);
+            println!("     (Continuing with Agent A tools only)");
+        }
     }
     
     // Fetch Payment Agent tools if available
@@ -157,8 +175,23 @@ When the user makes a request, analyze what tool(s) they need and provide a JSON
   "user_message": "friendly message to the user explaining the action"
 }}
 
-TRAVEL & PRICING TOOLS:
-- For ticket pricing: use get_ticket_price
+TRAVEL & PRICING TOOLS (from Agent B MCP Server):
+- For ticket pricing: use get-ticket-price
+  - Requires: from, to, optional vip boolean
+  - IMPORTANT: When user asks to book, ONLY suggest this tool first. Do NOT suggest book-flight yet.
+- For flight booking: use book-flight
+  - Requires: from, to, passenger_name, passenger_email
+  - IMPORTANT: Do NOT suggest this. The AI will call this automatically after payment completes.
+
+PAYMENT WORKFLOW:
+1. When user requests booking:
+   - ONLY suggest get-ticket-price first (with from, to, vip)
+   - Do NOT suggest other tools yet
+2. After user confirms and completes payment:
+   - book-flight will be called automatically with passenger details
+   - No need to suggest it
+
+OTHER TOOLS:
 - For formatting: use format_zk_input
 - For proof generation: use request_attestation (inform user it takes 11-27 minutes)
 - For verification: use verify_on_chain
@@ -170,12 +203,6 @@ PAYMENT TOOLS (if available):
   - Requires: sessionId, consumerId, tokenId (from enroll-card), amount, merchant
 - For retrieving credentials: use retrieve-payment-credentials
   - Requires: sessionId, consumerId, tokenId, instructionId (from initiate-purchase), transactionReferenceId
-
-PAYMENT WORKFLOW:
-1. If user wants to pay, first call enroll-card (if not already enrolled)
-2. Then call initiate-purchase-instruction with the transaction details
-3. User will confirm via biometric on their device
-4. Then call retrieve-payment-credentials to get payment credentials
 
 IMPORTANT:
 - Only suggest tools that match the user's request
@@ -244,10 +271,11 @@ fn parse_tool_calls(claude_response: &str) -> Result<Vec<(String, Value)>> {
     }
 }
 
-/// Call server tool via HTTP (routes to appropriate server: Agent A or Payment Agent)
+/// Call server tool via HTTP (routes to appropriate server: Agent A, Agent B, or Payment Agent)
 async fn call_server_tool(
     client: &reqwest::Client,
     agent_a_url: &str,
+    agent_b_url: &str,
     payment_agent_url: Option<&str>,
     tool_name: &str,
     arguments: Value,
@@ -260,6 +288,11 @@ async fn call_server_tool(
         "confirm-transaction",
     ];
     
+    let agent_b_tools = [
+        "get-ticket-price",
+        "book-flight",
+    ];
+    
     let target_url = if payment_tools.contains(&tool_name) {
         if let Some(payment_url) = payment_agent_url {
             payment_url.to_string()
@@ -269,6 +302,8 @@ async fn call_server_tool(
                 tool_name
             ));
         }
+    } else if agent_b_tools.contains(&tool_name) {
+        agent_b_url.to_string()
     } else {
         agent_a_url.to_string()
     };
@@ -381,7 +416,10 @@ async fn main() -> Result<()> {
         None
     };
     
-    let tool_definitions = match fetch_all_tools(&client, &config.server_url, payment_agent_url).await {
+    let agent_b_url = std::env::var("AGENT_B_MCP_URL")
+        .unwrap_or_else(|_| "http://localhost:8001".to_string());
+    
+    let tool_definitions = match fetch_all_tools(&client, &config.server_url, &agent_b_url, payment_agent_url).await {
         Ok(tools) => {
             println!("✓ Loaded {} tools from server(s)\n", 
                 tools.get("tools")
@@ -453,9 +491,9 @@ async fn main() -> Result<()> {
                                 // No tools needed, just show Claude's response
                                 println!("Agent A: {}\n", claude_response);
                             } else {
-                                // Track if this is a payment flow (includes pricing with get_ticket_price)
+                                // Track if this is a payment flow (triggered by get-ticket-price tool)
                                 let is_payment_flow = tool_calls.iter()
-                                    .any(|(name, _)| name == "get_ticket_price" || name.contains("enroll") || name.contains("purchase") || name.contains("retrieve"));
+                                    .any(|(name, _)| name == "get-ticket-price");
                                 
                                 if is_payment_flow {
                                     // Interactive payment workflow
@@ -475,6 +513,7 @@ async fn main() -> Result<()> {
                                             match call_server_tool(
                                                 &client,
                                                 &config.server_url,
+                                                &agent_b_url,
                                                 payment_agent_url,
                                                 tool_name,
                                                 arguments.clone(),
@@ -485,7 +524,7 @@ async fn main() -> Result<()> {
                                                     println!("✓ Result: {}\n", result);
                                                     
                                                     // Store pricing result
-                                                    if tool_name == "get_ticket_price" {
+                                                    if tool_name == "get-ticket-price" {
                                                         pricing_result = Some(result.clone());
                                                     }
                                                 }
@@ -500,12 +539,24 @@ async fn main() -> Result<()> {
                                     if let Some(pricing) = pricing_result {
                                         if let Ok(parsed) = serde_json::from_str::<Value>(&pricing) {
                                             if let Some(price) = parsed.get("price") {
-                                                println!("Agent A: Great! I found a flight from {} to {} for ${}.", 
-                                                    "NYC", "London", price);
+                                                println!("Agent A: Great! I found a flight from NYC to London for ${}.", price);
                                                 println!("Agent A: This includes all taxes and fees.\n");
                                                 
                                                 // Ask user if they want to proceed
                                                 if ask_confirmation_from_reader("Would you like to proceed with this booking?", &mut reader, &mut stdout)? {
+                                                    // Get passenger details
+                                                    print!("Please enter your full name: ");
+                                                    stdout.flush()?;
+                                                    let mut passenger_name = String::new();
+                                                    reader.read_line(&mut passenger_name)?;
+                                                    let passenger_name = passenger_name.trim().to_string();
+                                                    
+                                                    print!("Please enter your email address: ");
+                                                    stdout.flush()?;
+                                                    let mut passenger_email = String::new();
+                                                    reader.read_line(&mut passenger_email)?;
+                                                    let passenger_email = passenger_email.trim().to_string();
+                                                    
                                                     // Ask about payment method
                                                     println!("\nAgent A: Great! Let's set up your payment.\n");
                                                     println!("How would you like to pay?");
@@ -556,6 +607,13 @@ async fn main() -> Result<()> {
                                                                             println!("Agent A: I found an existing payment card in your account.\n");
                                                                             show_success("Your card is already enrolled with biometric authentication!");
                                                                             enrollment_complete = true;
+                                                                            
+                                                                            // Extract the first enrolled token ID
+                                                                            if let Some(token_ids) = data.get("enrolledTokenIds").and_then(|ids| ids.as_array()) {
+                                                                                if let Some(first_token) = token_ids.first().and_then(|t| t.as_str()) {
+                                                                                    enrollment_token_id = first_token.to_string();
+                                                                                }
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -585,6 +643,7 @@ async fn main() -> Result<()> {
                                                             match call_server_tool(
                                                                 &client,
                                                                 &config.server_url,
+                                                                &agent_b_url,
                                                                 payment_agent_url,
                                                                 "enroll-card",
                                                                 enroll_args,
@@ -644,6 +703,7 @@ async fn main() -> Result<()> {
                                                             match call_server_tool(
                                                                 &client,
                                                                 &config.server_url,
+                                                                &agent_b_url,
                                                                 payment_agent_url,
                                                                 "initiate-purchase-instruction",
                                                                 purchase_args,
@@ -670,6 +730,7 @@ async fn main() -> Result<()> {
                                                                             match call_server_tool(
                                                                                 &client,
                                                                                 &config.server_url,
+                                                                                &agent_b_url,
                                                                                 payment_agent_url,
                                                                                 "retrieve-payment-credentials",
                                                                                 retrieve_args,
@@ -698,8 +759,44 @@ async fn main() -> Result<()> {
                                                             
                                                             if payment_confirmed {
                                                                 show_success("Payment confirmed! Your booking is complete!");
-                                                                println!("Agent A: Your flight booking from NYC to London has been confirmed.\n");
-                                                                println!("Agent A: You'll receive a confirmation email shortly with your flight details and receipt.\n");
+                                                                
+                                                                // Now call book-flight with passenger details
+                                                                show_step(3, 3, "Completing your flight booking...");
+                                                                
+                                                                let book_args = json!({
+                                                                    "from": "NYC",
+                                                                    "to": "LON",
+                                                                    "passenger_name": passenger_name,
+                                                                    "passenger_email": passenger_email
+                                                                });
+                                                                
+                                                                println!("→ Invoking: book-flight with args {}", book_args);
+
+                                                                match call_server_tool(
+                                                                    &client,
+                                                                    &config.server_url,
+                                                                    &agent_b_url,
+                                                                    payment_agent_url,
+                                                                    "book-flight",
+                                                                    book_args,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(result) => {
+                                                                        println!("✓ Result: {}\n", result);
+                                                                        if let Ok(booking) = serde_json::from_str::<Value>(&result) {
+                                                                            if let Some(conf_code) = booking.get("confirmation_code").and_then(|c| c.as_str()) {
+                                                                                show_success("Flight booking confirmed!");
+                                                                                println!("Agent A: Your flight booking from NYC to London has been confirmed.\n");
+                                                                                println!("Agent A: Confirmation code: {}\n", conf_code);
+                                                                                println!("Agent A: You'll receive a confirmation email shortly with your flight details and receipt.\n");
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        println!("✗ Error booking flight: {}\n", e);
+                                                                    }
+                                                                }
                                                             }
                                                         } else {
                                                             println!("Agent A: Payment cancelled. Your booking has been cancelled.\n");
@@ -721,6 +818,7 @@ async fn main() -> Result<()> {
                                         match call_server_tool(
                                             &client,
                                             &config.server_url,
+                                            &agent_b_url,
                                             payment_agent_url,
                                             &tool_name,
                                             arguments,

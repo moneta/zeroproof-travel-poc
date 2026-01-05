@@ -3,8 +3,15 @@ members = [
     "pricing-core",
     "server",
     "program",
+    "mcp-server",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Agent B Contributors"]
+license = "MIT"
 
 # ===================================================================
 # Common dependencies shared by both crates
