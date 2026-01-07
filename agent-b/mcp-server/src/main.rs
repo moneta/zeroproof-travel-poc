@@ -249,11 +249,17 @@ async fn main() -> Result<()> {
         .route("/tools/book-flight", post(book_flight))
         .layer(CorsLayer::permissive());
 
+    // Get port from environment variable or use default
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "8001".to_string())
+        .parse::<u16>()?;
+    let addr = format!("0.0.0.0:{}", port);
+
     // Bind and serve
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8001")
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await?;
 
-    println!("✓ Agent B MCP Server running on http://0.0.0.0:8001");
+    println!("✓ Agent B MCP Server running on http://0.0.0.0:{}", port);
     println!("  GET  /tools                     — List all tools");
     println!("  POST /tools/get-ticket-price    — Get flight pricing");
     println!("  POST /tools/book-flight         — Book a flight\n");
