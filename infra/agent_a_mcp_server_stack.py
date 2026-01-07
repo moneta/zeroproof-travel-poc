@@ -19,7 +19,7 @@ class AgentAMCPServerStack(Stack):
         repo = ecr.Repository(
             self,
             "AgentAMCPServerRepo",
-            repository_name="agent-a-mcp-server",  # lowercase, as required by ECR
+            repository_name="agent-a-mcps",  # lowercase, as required by ECR
             image_tag_mutability=ecr.TagMutability.MUTABLE,
             removal_policy=RemovalPolicy.RETAIN,  # Safe default – keeps images on cdk destroy
         )
@@ -52,5 +52,5 @@ class AgentAMCPServerStack(Stack):
             self,
             "ImageUri",
             value=f"{repo.repository_uri}:{dest_tag}",
-            description="ECR Image URI with custom tag (agent-a-mcp-server:latest or agent-a-mcp-server:vX.Y.Z)",
+            description="ECR Image URI with custom tag (agent-a-mcps:latest or agent-a-mcps:vX.Y.Z)",
         )
