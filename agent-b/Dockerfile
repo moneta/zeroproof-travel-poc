@@ -12,13 +12,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace and build files
-COPY Cargo.toml Cargo.lock ./
+COPY agent-b/Cargo.toml agent-b/Cargo.lock ./
 
 # Copy workspace members
-COPY pricing-core/ ./pricing-core/
-COPY mcp-server/ ./mcp-server/
-COPY program/ ./program/
-COPY server/ ./server/
+COPY agent-b/pricing-core/ ./pricing-core/
+COPY agent-b/mcp-server/ ./mcp-server/
+COPY agent-b/program/ ./program/
+COPY agent-b/server/ ./server/
 
 # Build the MCP server in release mode
 RUN cargo build --release -p agent-b-mcp-server
