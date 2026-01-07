@@ -30,7 +30,7 @@ class AgentBMCPSStack(Stack):
             "AgentBMCPSImage",
             directory="..",
             file="agent-b/Dockerfile",
-            exclude=["cdk.out", "infra/cdk.out", ".git", "node_modules"],
+            exclude=["cdk.out", "infra/cdk.out", ".git", ".gitignore", "node_modules", "*.md"],
         )
 
         # Get the desired tag from CDK context (passed from GitHub Actions)

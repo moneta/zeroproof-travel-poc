@@ -1,0 +1,10 @@
+## 310-geth-configmap.yml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-b-mcps-config
+  labels:
+    app: agent-b-mcps
+data:
+  NODE_ENV: development
+  PORT: "8080"
