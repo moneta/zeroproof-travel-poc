@@ -1,4 +1,4 @@
-# Multi-stage build for Agent A MCP Server (Rust)
+# Multi-stage build for Agent A MCP Client (Rust)
 # Stage 1: Builder
 FROM rust:latest AS builder
 
@@ -22,8 +22,8 @@ COPY agent-a/src/ ./src/
 # Copy shared protocol
 COPY zk-protocol/ ../zk-protocol/
 
-# Build the MCP server in release mode
-RUN cargo build --release -p agent-a-mcp-server
+# Build the MCP client in release mode
+RUN cargo build --release -p mcp-client
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -33,23 +33,21 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary from builder
-COPY --from=builder /app/target/release/agent-a-mcp /app/agent-a-mcp
+COPY --from=builder /app/target/release/mcp-client /app/mcp-client
 
 # Set environment variables with defaults
-ENV AGENT_B_URL=http://localhost:8001
-ENV ATTESTER_URL=http://localhost:8000
-ENV ZEROPROOF_ADDRESS=0x9C33252D29B41Fe2706704a8Ca99E8731B58af41
-ENV RPC_URL=http://json-rpc.9lmur1sx205wod4wavn42kr8r.blockchainnodeengine.com/?key=AIzaSyBanzf369uxM4kL0EHhXh5HSZpk3J8_4nA
+ENV AGENT_A_URL=http://localhost:3029
 ENV RUST_LOG=info
 
-# Expose the MCP server port
-EXPOSE 3029
+# Expose the MCP client port
+EXPOSE 3030
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3029/ || exit 1
+    CMD curl -f http://localhost:3030/health || exit 1
 
-ENTRYPOINT ["/app/agent-a-mcp"]
+ENTRYPOINT ["/app/mcp-client"]
