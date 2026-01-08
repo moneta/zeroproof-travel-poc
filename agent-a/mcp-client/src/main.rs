@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
+// Import from library
+use mcp_client::proxy_fetch;
+
 // Load .env file on startup
 fn init_env() {
     let _ = dotenv::dotenv();
@@ -271,6 +274,66 @@ fn parse_tool_calls(claude_response: &str) -> Result<Vec<(String, Value)>> {
     }
 }
 
+/// Build tool options map for payment tools with appropriate redactions
+fn build_payment_tool_options() -> std::collections::HashMap<String, proxy_fetch::ZkfetchToolOptions> {
+    use std::collections::HashMap;
+    
+    let mut options_map = HashMap::new();
+    
+    // Redactions for sensitive payment fields
+    let payment_redactions = vec![
+        json!({"path": "body.card_number"}),
+        json!({"path": "body.cvv"}),
+        json!({"path": "body.expiry_date"}),
+        json!({"path": "body.cardholder_name"}),
+        json!({"path": "body.pin"}),
+        json!({"path": "response.card_number"}),
+        json!({"path": "response.cvv"}),
+    ];
+    
+    // Enroll card tool - redact all PII and card details
+    options_map.insert(
+        "enroll-card".to_string(),
+        proxy_fetch::ZkfetchToolOptions {
+            public_options: Some(json!({"action": "enroll"})),
+            private_options: None,
+            redactions: Some(payment_redactions.clone()),
+        },
+    );
+    
+    // Initiate purchase instruction - redact sensitive data
+    options_map.insert(
+        "initiate-purchase-instruction".to_string(),
+        proxy_fetch::ZkfetchToolOptions {
+            public_options: Some(json!({"action": "purchase"})),
+            private_options: None,
+            redactions: Some(payment_redactions.clone()),
+        },
+    );
+    
+    // Retrieve payment credentials - redact all credentials
+    options_map.insert(
+        "retrieve-payment-credentials".to_string(),
+        proxy_fetch::ZkfetchToolOptions {
+            public_options: Some(json!({"action": "retrieve"})),
+            private_options: None,
+            redactions: Some(payment_redactions.clone()),
+        },
+    );
+    
+    // Confirm transaction - redact sensitive transaction details
+    options_map.insert(
+        "confirm-transaction".to_string(),
+        proxy_fetch::ZkfetchToolOptions {
+            public_options: Some(json!({"action": "confirm"})),
+            private_options: None,
+            redactions: Some(payment_redactions),
+        },
+    );
+    
+    options_map
+}
+
 /// Call server tool via HTTP (routes to appropriate server: Agent A, Agent B, or Payment Agent)
 async fn call_server_tool(
     client: &reqwest::Client,
@@ -293,9 +356,30 @@ async fn call_server_tool(
         "book-flight",
     ];
     
-    let target_url = if payment_tools.contains(&tool_name) {
+    // Use proxy_fetch for payment tools to enable zkfetch routing
+    if payment_tools.contains(&tool_name) {
         if let Some(payment_url) = payment_agent_url {
-            payment_url.to_string()
+            let proxy_config = proxy_fetch::ProxyConfig {
+                url: std::env::var("PROXY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
+                proxy_type: std::env::var("PROXY_TYPE").unwrap_or_else(|_| "direct".to_string()),
+                username: std::env::var("PROXY_USERNAME").ok(),
+                password: std::env::var("PROXY_PASSWORD").ok(),
+                tool_options_map: Some(build_payment_tool_options()),
+                default_zk_options: None,
+                debug: std::env::var("DEBUG_PROXY_FETCH").is_ok(),
+            };
+            
+            let proxy_fetch = proxy_fetch::ProxyFetch::new(proxy_config)?;
+            
+            let url = format!("{}/tools/{}", payment_url, tool_name);
+            println!("[PAYMENT_PROXY_FETCH] Calling: {}", url);
+            println!("[PAYMENT_PROXY_FETCH] Tool: {}", tool_name);
+            println!("[PAYMENT_PROXY_FETCH] Arguments: {}", arguments);
+            
+            let response = proxy_fetch.post(&url, Some(arguments)).await?;
+            println!("[PAYMENT_PROXY_FETCH] Response: {}", response);
+            
+            Ok(response.to_string())
         } else {
             return Err(anyhow!(
                 "Tool '{}' requires Payment Agent, but PAYMENT_AGENT_URL not configured",
@@ -303,42 +387,73 @@ async fn call_server_tool(
             ));
         }
     } else if agent_b_tools.contains(&tool_name) {
-        agent_b_url.to_string()
-    } else {
-        agent_a_url.to_string()
-    };
+        // Agent B tools use direct HTTP calls for now
+        let url = format!("{}/tools/{}", agent_b_url, tool_name);
 
-    let url = format!("{}/tools/{}", target_url, tool_name);
+        let response = client
+            .post(&url)
+            .json(&arguments)
+            .send()
+            .await?;
 
-    let response = client
-        .post(&url)
-        .json(&arguments)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let error_text = response.text().await?;
-        return Err(anyhow!("Server error: {}", error_text));
-    }
-
-    let result: Value = response.json().await?;
-
-    if let Some(error) = result.get("error") {
-        // Check if error is not null
-        if error.is_null() {
-            // Error field exists but is null, check for data
-            if let Some(data) = result.get("data") {
-                Ok(data.to_string())
-            } else {
-                Err(anyhow!("Invalid server response"))
-            }
-        } else {
-            Err(anyhow!("Tool error: {}", error))
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!("Server error: {}", error_text));
         }
-    } else if let Some(data) = result.get("data") {
-        Ok(data.to_string())
+
+        let result: Value = response.json().await?;
+
+        if let Some(error) = result.get("error") {
+            // Check if error is not null
+            if error.is_null() {
+                // Error field exists but is null, check for data
+                if let Some(data) = result.get("data") {
+                    Ok(data.to_string())
+                } else {
+                    Err(anyhow!("Invalid server response"))
+                }
+            } else {
+                Err(anyhow!("Tool error: {}", error))
+            }
+        } else if let Some(data) = result.get("data") {
+            Ok(data.to_string())
+        } else {
+            Err(anyhow!("Invalid server response"))
+        }
     } else {
-        Err(anyhow!("Invalid server response"))
+        // Agent A tools use direct HTTP calls
+        let url = format!("{}/tools/{}", agent_a_url, tool_name);
+
+        let response = client
+            .post(&url)
+            .json(&arguments)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!("Server error: {}", error_text));
+        }
+
+        let result: Value = response.json().await?;
+
+        if let Some(error) = result.get("error") {
+            // Check if error is not null
+            if error.is_null() {
+                // Error field exists but is null, check for data
+                if let Some(data) = result.get("data") {
+                    Ok(data.to_string())
+                } else {
+                    Err(anyhow!("Invalid server response"))
+                }
+            } else {
+                Err(anyhow!("Tool error: {}", error))
+            }
+        } else if let Some(data) = result.get("data") {
+            Ok(data.to_string())
+        } else {
+            Err(anyhow!("Invalid server response"))
+        }
     }
 }
 
@@ -668,7 +783,14 @@ async fn main() -> Result<()> {
                                                                             parsed.get("status").and_then(|s| s.as_str()).map(|s| s == "SUCCESS").unwrap_or(false);
                                                                         
                                                                         if is_success {
-                                                                            if let Some(token_id) = parsed.get("tokenId").and_then(|t| t.as_str()) {
+                                                                            // Try to get tokenId from data.tokenId (payment agent response format)
+                                                                            let token_id = parsed
+                                                                                .get("data")
+                                                                                .and_then(|data| data.get("tokenId"))
+                                                                                .or_else(|| parsed.get("tokenId"))
+                                                                                .and_then(|t| t.as_str());
+                                                                            
+                                                                            if let Some(token_id) = token_id {
                                                                                 enrollment_token_id = token_id.to_string();
                                                                             }
                                                                             show_success("Your card has been enrolled with biometric authentication!");
@@ -727,7 +849,14 @@ async fn main() -> Result<()> {
                                                                     
                                                                     // Extract instructionId from purchase result
                                                                     if let Ok(purchase_response) = serde_json::from_str::<Value>(&result) {
-                                                                        if let Some(instruction_id) = purchase_response.get("instructionId").and_then(|id| id.as_str()) {
+                                                                        // Try to get instructionId from data.instructionId (payment agent response format)
+                                                                        let instruction_id = purchase_response
+                                                                            .get("data")
+                                                                            .and_then(|data| data.get("instructionId"))
+                                                                            .or_else(|| purchase_response.get("instructionId"))
+                                                                            .and_then(|id| id.as_str());
+                                                                        
+                                                                        if let Some(instruction_id) = instruction_id {
                                                                             // Execute credential retrieval with actual instructionId
                                                                             let retrieve_args = json!({
                                                                                 "sessionId": "sess_user_123",

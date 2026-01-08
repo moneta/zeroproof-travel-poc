@@ -3,6 +3,5 @@
 
 pub mod orchestration;
 pub mod proxy_fetch;
-pub mod payment_signature;
 
 pub use orchestration::{AgentConfig, BookingState, ClaudeMessage, process_user_query};
