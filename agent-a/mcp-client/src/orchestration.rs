@@ -792,7 +792,7 @@ pub async fn process_user_query(
                         state.price = price;
                         
                         let response = format!(
-                            "Agent A: Great! I found a flight from {} to {} for ${}.\n\nThis includes all taxes and fees.\n\nTo complete your booking, please provide:\n1. Your full name\n2. Your email address\n\nThen I'll process your payment and confirm your flight.",
+                            "Agent A: Great! I found a flight from {} to {} for ${}.\n\nThis includes all taxes and fees.\n\nTo complete your booking, please provide:\n1. Your full name\n2. Your email address\n\nGive me your fullname first!",
                             from, to, price
                         );
                         
@@ -929,8 +929,21 @@ pub async fn process_user_query(
                             return Ok((response, updated_messages, state.clone()));
                         }
                         
-                        // User confirmed enrollment. Now proceed with full payment (Turn 3)
+                        // User confirmed enrollment. Now proceed with full payment (Turn 6)
                         if state.step == "enrollment_confirmation" {
+                            // First check if user is responding to the enrollment confirmation prompt
+                            let response_lower = user_query.trim().to_lowercase();
+                            
+                            if !response_lower.contains("yes") && !response_lower.contains("ok") && !response_lower.contains("confirm") && !response_lower.contains("proceed") && !response_lower.contains("y") {
+                                // User didn't confirm, ask again
+                                let response = "Agent A: I need your confirmation to proceed. Are you ready to proceed with payment enrollment? (Yes/No)".to_string();
+                                updated_messages.push(ClaudeMessage {
+                                    role: "assistant".to_string(),
+                                    content: response.clone(),
+                                });
+                                return Ok((response, updated_messages, state.clone()));
+                            }
+                            
                             let from = state.from.clone();
                             let to = state.to.clone();
                             let price = state.price;
