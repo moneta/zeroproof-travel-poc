@@ -7,7 +7,7 @@ metadata:
     app: agent-a-mcpc
 data:
   NODE_ENV: development
-  PORT: "3030"
+  PORT: "3001"
   AGENT_A_MODE: http
   AGENT_A_SERVER_URL: http://localhost:3001
   AGENT_B_MCP_URL: https://dev.agentb.zeroproofai.com
