@@ -737,51 +737,16 @@ pub async fn process_user_query(
     }
     
     // Extract name and email using Claude's understanding
-    let extract_passenger_info = async |step: &str, user_input: &str| -> Result<(Option<String>, Option<String>)> {
-        let extraction_prompt = match step {
-            "passenger_name" => format!(
-                "Extract the passenger's full name from this user input: \"{}\"\n\nRespond with ONLY the name, nothing else. If no name is provided, respond with: NONE",
-                user_input
-            ),
-            "passenger_email" => format!(
-                "Extract the email address from this user input: \"{}\"\n\nRespond with ONLY the email address, nothing else. If no email is provided, respond with: NONE",
-                user_input
-            ),
-            _ => return Ok((None, None)),
-        };
-
-        let client = reqwest::Client::new();
-        let claude_extraction = call_claude(
-            &client,
-            config,
-            &extraction_prompt,
-            &[],
-            state,
-            &json!({}),
-        ).await.unwrap_or_default();
-
-        let trimmed = claude_extraction.trim();
-        if trimmed.to_uppercase() == "NONE" || trimmed.is_empty() {
-            Ok((None, None))
-        } else {
-            match step {
-                "passenger_name" => Ok((Some(trimmed.to_string()), None)),
-                "passenger_email" => Ok((None, Some(trimmed.to_string()))),
-                _ => Ok((None, None)),
-            }
-        }
-    };
-    
     // User provided name, now ask for email
     if state.step == "passenger_name" {
-        let (extracted_name, _) = extract_passenger_info("passenger_name", user_query).await?;
+        let extracted_name = extract_with_claude(&client, config, "passenger_name", user_query, state, &tool_definitions).await?;
         
-        if let Some(name) = extracted_name {
-            state.passenger_name = Some(name.clone());
+        if !extracted_name.is_empty() {
+            state.passenger_name = Some(extracted_name.clone());
             state.step = "passenger_email".to_string();
             let response = format!(
                 "Agent A: Perfect! Got it - {}.\n\n📧 Step 2: Email Address\n\nWhat is your email address?",
-                name
+                extracted_name
             );
             updated_messages.push(ClaudeMessage {
                 role: "assistant".to_string(),
@@ -801,16 +766,16 @@ pub async fn process_user_query(
     
     // User provided email, now ask for payment method
     if state.step == "passenger_email" {
-        let (_, extracted_email) = extract_passenger_info("passenger_email", user_query).await?;
+        let extracted_email = extract_with_claude(&client, config, "passenger_email", user_query, state, &tool_definitions).await?;
         
-        if let Some(email) = extracted_email {
-            state.passenger_email = Some(email.clone());
+        if !extracted_email.is_empty() {
+            state.passenger_email = Some(extracted_email.clone());
             state.step = "payment_method".to_string();
             let passenger_name = state.passenger_name.clone().unwrap_or_default();
             
             let response = format!(
                 "Agent A: Excellent! I have your details:\n- Name: {}\n- Email: {}\n\n💳 Step 3: Payment Method\n\nHow would you like to pay for this ${} flight?\n1. Visa Credit Card\n2. Other payment method\n\nPlease reply with 1 or 2.",
-                passenger_name, email, state.price as i32
+                passenger_name, extracted_email, state.price as i32
             );
             updated_messages.push(ClaudeMessage {
                 role: "assistant".to_string(),
@@ -1162,7 +1127,43 @@ fn extract_from_route(message: &str) -> Option<String> {
     }
     None
 }
+/// Helper: Extract information from user input using Claude's understanding
+async fn extract_with_claude(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+    field: &str,
+    user_input: &str,
+    state: &BookingState,
+    tool_definitions: &Value,
+) -> Result<String> {
+    let extraction_prompt = match field {
+        "passenger_name" => format!(
+            "Extract the passenger's full name from this user input: \"{}\"\n\nRespond with ONLY the name, nothing else. If no name is provided, respond with: NONE",
+            user_input
+        ),
+        "passenger_email" => format!(
+            "Extract the email address from this user input: \"{}\"\n\nRespond with ONLY the email address, nothing else. If no email is provided, respond with: NONE",
+            user_input
+        ),
+        _ => return Ok(String::new()),
+    };
 
+    let claude_extraction = call_claude(
+        client,
+        config,
+        &extraction_prompt,
+        &[],
+        state,
+        tool_definitions,
+    ).await.unwrap_or_default();
+
+    let trimmed = claude_extraction.trim();
+    if trimmed.to_uppercase() == "NONE" || trimmed.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
 /// Helper: Extract to city from message
 /// Helper: Extract to city from message
 #[allow(dead_code)]
