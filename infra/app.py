@@ -4,6 +4,7 @@ import aws_cdk as cdk
 from agent_b_mcp_server_stack import AgentBMCPSStack
 from agent_a_mcp_server_stack import AgentAMCPServerStack
 from agent_a_mcp_client_stack import AgentAMCPClientStack
+from ai_agent_web_stack import AIAgentWebStack
 
 env = cdk.Environment(
     account="940333627479",
@@ -22,8 +23,13 @@ AgentAMCPServerStack(app, "AgentAMCPServerStack",
     env=env,
 )
 
-# Deploy Agent A MCP Client
+# Deploy Agent A MCP Client (HTTP Server)
 AgentAMCPClientStack(app, "AgentAMCPClientStack",
+    env=env,
+)
+
+# Deploy AI Agent Web UI
+AIAgentWebStack(app, "AIAgentWebStack",
     env=env,
 )
 
