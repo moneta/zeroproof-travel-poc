@@ -26,7 +26,8 @@ securityContext: {}
 
 service:
   type: ClusterIP
-  port: 3001
+  port: 80               # External access on standard HTTP port
+  targetPort: 3000       # Forward to container's 3000
 
 ingress:
   enabled: true
