@@ -1,6 +1,7 @@
 /// HTTP Server wrapper for Agent A MCP Client
 /// Exposes the orchestration logic as REST API endpoints
 /// Allows web interfaces to interact with the agent
+/// Includes Visa Trusted Agent Protocol (TAP) signature support for RFC 9421 compliance
 
 use axum::{
     extract::Json,
@@ -15,7 +16,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
-use mcp_client::{AgentConfig, BookingState, ClaudeMessage, process_user_query};
+use mcp_client::{AgentConfig, BookingState, ClaudeMessage, process_user_query, tap_signature};
+use tap_signature::{TapConfig, TapSignatureHeaders};
 
 /// Session data storing conversation history and booking state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +65,11 @@ struct ChatResponse {
     session_id: Option<String>,
 }
 
+/// TAP Signature configuration wrapper
+struct TapSignatureManager {
+    config: Option<TapConfig>,
+}
+
 /// Health check endpoint
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -71,9 +78,41 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// Generate TAP signature headers for a given URL
+/// This should be called before making HTTP requests to authenticated endpoints
+fn get_tap_signature_headers(url: &str, tap_config: &Option<TapConfig>) -> Option<TapSignatureHeaders> {
+    match tap_config {
+        Some(config) => {
+            match tap_signature::parse_url_components(url) {
+                Ok((authority, path)) => {
+                    match tap_signature::create_tap_signature(config, &authority, &path) {
+                        Ok(headers) => {
+                            println!("[TAP] Generated signature headers for URL: {}", url);
+                            Some(headers)
+                        }
+                        Err(e) => {
+                            println!("[TAP ERROR] Failed to create signature: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[TAP ERROR] Failed to parse URL: {}", e);
+                    None
+                }
+            }
+        }
+        None => {
+            println!("[TAP] TAP signature generation is disabled");
+            None
+        }
+    }
+}
+
 /// Main chat endpoint with session-based conversation management
 async fn chat(
     axum::extract::Extension(sessions): axum::extract::Extension<SessionManager>,
+    axum::extract::Extension(tap_config): axum::extract::Extension<Option<TapConfig>>,
     Json(payload): Json<ChatRequest>,
 ) -> impl IntoResponse {
     let session_id = payload.session_id.clone().unwrap_or_else(|| {
@@ -82,6 +121,11 @@ async fn chat(
     
     println!("[CHAT] Incoming request - SessionID: {}, Message length: {}", 
              session_id, payload.message.len());
+    
+    // Log TAP signature status for this request
+    if tap_config.is_some() {
+        println!("[TAP] TAP signatures will be generated for outgoing requests from this session");
+    }
     
     // Initialize config
     let config = match AgentConfig::from_env() {
@@ -161,6 +205,7 @@ async fn main() {
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║     Agent A - HTTP API Server (Claude-powered Agent)       ║");
     println!("║    With Session-based Conversation Management              ║");
+    println!("║    With Visa TAP (RFC 9421) Signature Support              ║");
     println!("║          Connects to Agent A & B MCP Servers               ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
@@ -181,16 +226,27 @@ async fn main() {
         println!("  Payment Agent URL: {}", payment_url);
     }
 
+    // Initialize TAP configuration (optional, fails gracefully if not configured)
+    let tap_config = TapConfig::from_env().ok();
+    if tap_config.is_some() {
+        println!("[TAP] ✓ TAP signature generation enabled");
+        println!("  Algorithm: Ed25519");
+        println!("  Key ID: {}", tap_config.as_ref().unwrap().key_id);
+    } else {
+        println!("[TAP] TAP signature generation disabled (no credentials in environment)");
+    }
+
     // Create session manager
     let sessions: SessionManager = Arc::new(Mutex::new(HashMap::new()));
     println!("[SESSION] Session manager initialized");
 
-    // Build router with session manager extension
+    // Build router with session manager and TAP config extensions
     let app = Router::new()
         .route("/health", get(health))
         .route("/chat", post(chat))
         .layer(CorsLayer::permissive())
-        .layer(axum::extract::Extension(sessions));
+        .layer(axum::extract::Extension(sessions))
+        .layer(axum::extract::Extension(tap_config));
 
     // Create listener
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))

@@ -40,6 +40,14 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID generation
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
+# Cryptography for TAP protocol
+sha2 = "0.10"
+rsa = "0.9"
+rand = "0.8"
+
+# URL parsing
+url = "2.5"
+
 [[bin]]
 name = "mcp-client"
 path = "src/main.rs"
