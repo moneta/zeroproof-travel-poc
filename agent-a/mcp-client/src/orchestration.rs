@@ -38,6 +38,19 @@ pub struct ContentBlock {
     pub text: String,
 }
 
+/// Cryptographic proof record for tool calls
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CryptographicProof {
+    pub tool_name: String,
+    pub timestamp: u64,
+    pub request: serde_json::Value,
+    pub response: serde_json::Value,
+    pub proof: serde_json::Value, // zkfetch proof
+    pub proof_id: Option<String>,
+    pub verified: bool,
+    pub onchain_compatible: bool,
+}
+
 /// Booking state tracking across multi-turn conversations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookingState {
@@ -51,6 +64,8 @@ pub struct BookingState {
     pub enrollment_token_id: Option<String>,
     pub instruction_id: Option<String>,
     pub vip: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cryptographic_traces: Vec<CryptographicProof>, // Collected proofs from agent-b calls
 }
 
 impl Default for BookingState {
@@ -66,6 +81,7 @@ impl Default for BookingState {
             enrollment_token_id: None,
             instruction_id: None,
             vip: false,
+            cryptographic_traces: Vec::new(),
         }
     }
 }
@@ -76,6 +92,7 @@ pub struct AgentConfig {
     pub server_url: String,
     pub payment_agent_url: Option<String>,
     pub payment_agent_enabled: bool,
+    pub zkfetch_wrapper_url: Option<String>,
 }
 
 impl AgentConfig {
@@ -90,12 +107,15 @@ impl AgentConfig {
         let payment_agent_enabled = std::env::var("PAYMENT_AGENT_ENABLED")
             .unwrap_or_else(|_| "true".to_string())
             .to_lowercase() == "true";
+        
+        let zkfetch_wrapper_url = std::env::var("ZKFETCH_WRAPPER_URL").ok();
 
         Ok(Self {
             claude_api_key,
             server_url,
             payment_agent_url,
             payment_agent_enabled,
+            zkfetch_wrapper_url,
         })
     }
 }
@@ -378,6 +398,174 @@ pub fn parse_tool_calls(claude_response: &str) -> Result<Vec<(String, Value)>> {
     }
 }
 
+/// Call any MCP server tool through zkfetch-wrapper to get cryptographic proof
+pub async fn call_tool_with_proof(
+    client: &reqwest::Client,
+    server_url: &str,
+    zkfetch_wrapper_url: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<(String, Option<CryptographicProof>)> {
+    // If zkfetch-wrapper is configured, use it to get cryptographic proof
+    if let Some(zkfetch_url) = zkfetch_wrapper_url {
+        println!("[TOOL] Calling {} via zkfetch-wrapper (PROXIED)", tool_name);
+        // zkfetch-wrapper expects:
+        // POST /zkfetch with { url, publicOptions, privateOptions }
+        let target_url = format!("{}/tools/{}", server_url, tool_name);
+        
+        // The request body goes in publicOptions.body as JSON string
+        let zkfetch_payload = json!({
+            "url": target_url,
+            "publicOptions": {
+                "method": "POST",
+                "headers": {
+                    "Content-Type": "application/json"
+                },
+                "body": arguments.to_string()
+            }
+        });
+
+        println!("[ZKFETCH] Calling Agent B through zkfetch-wrapper: {}", tool_name);
+        
+        match client
+            .post(&format!("{}/zkfetch", zkfetch_url))
+            .json(&zkfetch_payload)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                match response.json::<Value>().await {
+                    Ok(zkfetch_response) => {
+                        println!("[ZKFETCH] Received proof for tool: {}", tool_name);
+                        
+                        // Extract the tool response
+                        let tool_result = zkfetch_response.get("data").cloned().unwrap_or(json!({}));
+                        
+                        // Extract proof information
+                        let proof = zkfetch_response.get("proof").cloned();
+                        let verified = zkfetch_response.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let onchain_compatible = zkfetch_response.get("metadata")
+                            .and_then(|m| m.get("onchain_compatible"))
+                            .and_then(|o| o.as_bool())
+                            .unwrap_or(false);
+                        
+                        // Create cryptographic proof record
+                        let crypto_proof = if let Some(proof_data) = proof {
+                            Some(CryptographicProof {
+                                tool_name: tool_name.to_string(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                request: arguments,
+                                response: tool_result.clone(),
+                                proof: proof_data,
+                                proof_id: zkfetch_response.get("metadata")
+                                    .and_then(|m| m.get("proof_id"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|s| s.to_string()),
+                                verified,
+                                onchain_compatible,
+                            })
+                        } else {
+                            None
+                        };
+                        
+                        // Extract data and return
+                        if let Some(data) = tool_result.get("data") {
+                            println!("[PROOF] ✓ Proof collected for {} - Verified: {}, On-chain: {}", 
+                                     tool_name, verified, onchain_compatible);
+                            return Ok((data.to_string(), crypto_proof));
+                        } else {
+                            return Ok((tool_result.to_string(), crypto_proof));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ZKFETCH] Failed to parse zkfetch response: {}", e);
+                        // Fall back to direct call
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[ZKFETCH] Failed to call zkfetch-wrapper: {}", e);
+                // Fall back to direct call
+            }
+        }
+    }
+    
+    // Fallback: Direct call to Agent B without proof
+    println!("[TOOL] Calling {} DIRECTLY (NO PROXY) - zkfetch-wrapper not configured", tool_name);
+    let url = format!("{}/tools/{}", server_url, tool_name);
+
+    let response = client
+        .post(&url)
+        .json(&arguments)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await?;
+        return Err(anyhow!("Server error: {}", error_text));
+    }
+
+    let result: Value = response.json().await?;
+
+    if let Some(error) = result.get("error") {
+        if error.is_null() {
+            if let Some(data) = result.get("data") {
+                println!("[TOOL] ✓ Direct call to {} succeeded (no proof collected)", tool_name);
+                Ok((data.to_string(), None))
+            } else {
+                Err(anyhow!("Invalid server response"))
+            }
+        } else {
+            Err(anyhow!("Tool error: {}", error))
+        }
+    } else if let Some(data) = result.get("data") {
+        println!("[TOOL] ✓ Direct call to {} succeeded (no proof collected)", tool_name);
+        Ok((data.to_string(), None))
+    } else {
+        Err(anyhow!("Invalid server response"))
+    }
+}
+
+/// Call server tool via HTTP with optional zkfetch proof collection
+pub async fn call_server_tool_with_proof(
+    client: &reqwest::Client,
+    agent_a_url: &str,
+    agent_b_url: &str,
+    payment_agent_url: Option<&str>,
+    zkfetch_wrapper_url: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<(String, Option<CryptographicProof>)> {
+    let agent_b_tools = [
+        "get-ticket-price",
+        "book-flight",
+    ];
+    
+    let payment_tools = [
+        "enroll-card",
+        "initiate-purchase-instruction",
+        "retrieve-payment-credentials",
+    ];
+    
+    if agent_b_tools.contains(&tool_name) {
+        // Agent B tools - use zkfetch-wrapper if available to get proof
+        return call_tool_with_proof(client, agent_b_url, zkfetch_wrapper_url, tool_name, arguments).await;
+    }
+    
+    if payment_tools.contains(&tool_name) && payment_agent_url.is_some() {
+        // Payment Agent tools - use zkfetch-wrapper if available to get proof
+        return call_tool_with_proof(client, payment_agent_url.unwrap(), zkfetch_wrapper_url, tool_name, arguments).await;
+    }
+    
+    // For non-Agent-B tools, use direct calls (backward compatibility)
+    call_server_tool(client, agent_a_url, agent_b_url, payment_agent_url, tool_name, arguments)
+        .await
+        .map(|result| (result, None))
+}
+
 /// Call server tool via HTTP (routes to appropriate server: Agent A, Agent B, or Payment Agent)
 pub async fn call_server_tool(
     client: &reqwest::Client,
@@ -507,6 +695,7 @@ pub async fn complete_booking_with_payment(
     price: f64,
     passenger_name: &str,
     passenger_email: &str,
+    state: &mut BookingState,
 ) -> Result<String> {
     let client = reqwest::Client::new();
 
@@ -518,6 +707,10 @@ pub async fn complete_booking_with_payment(
     } else {
         None
     };
+
+    let zkfetch_wrapper_url = config.zkfetch_wrapper_url.as_deref();
+    
+    let zkfetch_wrapper_url = config.zkfetch_wrapper_url.as_deref();
 
     let session_id = session_id.to_string();
     let mut enrollment_token_id = "token_789".to_string();
@@ -668,17 +861,38 @@ pub async fn complete_booking_with_payment(
         "passenger_email": passenger_email
     });
 
-    match call_server_tool(
+    match call_server_tool_with_proof(
         &client,
         &config.server_url,
         &agent_b_url,
         payment_agent_url,
+        zkfetch_wrapper_url,
         "book-flight",
         book_args,
     )
     .await
     {
-        Ok(result) => {
+        Ok((result, proof)) => {
+            // Collect and submit cryptographic proof if available
+            if let Some(crypto_proof) = proof {
+                state.cryptographic_traces.push(crypto_proof.clone());
+                println!("[PROOF] Collected proof for book-flight: {}", state.cryptographic_traces.len());
+                
+                // Submit proof to database asynchronously
+                let server_url = config.server_url.clone();
+                let session_id_str = session_id.to_string();
+                tokio::spawn(async move {
+                    match submit_proof_to_database(&server_url, &session_id_str, &crypto_proof).await {
+                        Ok(proof_id) => {
+                            println!("[PROOF] Submitted proof to database: {}", proof_id);
+                        }
+                        Err(e) => {
+                            eprintln!("[PROOF] Failed to submit proof to database: {}", e);
+                        }
+                    }
+                });
+            }
+            
             if let Ok(booking) = serde_json::from_str::<Value>(&result) {
                 if let Some(conf_code) = booking.get("confirmation_code").and_then(|c| c.as_str()) {
                     return Ok(format!(
@@ -714,6 +928,8 @@ pub async fn process_user_query(
     } else {
         None
     };
+    
+    let zkfetch_wrapper_url = config.zkfetch_wrapper_url.as_deref();
 
     let tool_definitions = fetch_all_tools(&client, &config.server_url, &agent_b_url, payment_agent_url).await?;
 
@@ -824,17 +1040,38 @@ pub async fn process_user_query(
                                 to = t.to_string();
                             }
 
-                            match call_server_tool(
+                            match call_server_tool_with_proof(
                                 &client,
                                 &config.server_url,
                                 &agent_b_url,
                                 payment_agent_url,
+                                zkfetch_wrapper_url,
                                 tool_name,
                                 arguments.clone(),
                             )
                             .await
                             {
-                                Ok(result) => {
+                                Ok((result, proof)) => {
+                                    // Collect and submit cryptographic proof if available
+                                    if let Some(crypto_proof) = proof {
+                                        state.cryptographic_traces.push(crypto_proof.clone());
+                                        println!("[PROOF] Collected proof for {}: {}", tool_name, state.cryptographic_traces.len());
+                                        
+                                        // Submit proof to database asynchronously
+                                        let server_url = config.server_url.clone();
+                                        let session_id = session_id.to_string();
+                                        tokio::spawn(async move {
+                                            match submit_proof_to_database(&server_url, &session_id, &crypto_proof).await {
+                                                Ok(proof_id) => {
+                                                    println!("[PROOF] Submitted proof to database: {}", proof_id);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[PROOF] Failed to submit proof to database: {}", e);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    
                                     if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
                                         if let Some(p) = parsed.get("price").and_then(|v| v.as_f64()) {
                                             price = p;
@@ -956,6 +1193,7 @@ pub async fn process_user_query(
                                 price,
                                 &passenger_name,
                                 &passenger_email,
+                                state,
                             )
                             .await
                             {
@@ -1077,5 +1315,87 @@ async fn extract_with_claude(
         Ok(String::new())
     } else {
         Ok(trimmed.to_string())
+    }
+}
+/// Submit a cryptographic proof to the Agent-A proof database with workflow metadata
+pub async fn submit_proof_to_database(
+    server_url: &str,
+    session_id: &str,
+    proof: &CryptographicProof,
+) -> Result<String> {
+    submit_proof_to_database_with_metadata(
+        server_url,
+        session_id,
+        proof,
+        None,  // sequence - will be auto-assigned by database
+        None,  // related_proof_id
+        None,  // workflow_stage - will be inferred from tool_name
+    ).await
+}
+
+/// Submit a proof with full workflow metadata
+pub async fn submit_proof_to_database_with_metadata(
+    server_url: &str,
+    session_id: &str,
+    proof: &CryptographicProof,
+    sequence: Option<u32>,
+    related_proof_id: Option<String>,
+    workflow_stage: Option<String>,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/proofs", server_url);
+    
+    // Infer workflow_stage from tool_name if not provided
+    let inferred_stage = workflow_stage.or_else(|| {
+        match proof.tool_name.as_str() {
+            "get-ticket-price" | "get-flight-options" => Some("pricing".to_string()),
+            "enroll-card" => Some("payment_enrollment".to_string()),
+            "create-payment-instruction" | "pay-for-ticket" => Some("payment".to_string()),
+            "book-flight" => Some("booking".to_string()),
+            _ => None,
+        }
+    });
+    
+    let mut payload = json!({
+        "session_id": session_id,
+        "tool_name": proof.tool_name,
+        "timestamp": proof.timestamp,
+        "request": proof.request,
+        "response": proof.response,
+        "proof": proof.proof,
+        "proof_id": proof.proof_id,
+        "verified": proof.verified,
+        "onchain_compatible": proof.onchain_compatible,
+        "submitted_by": "agent-a"
+    });
+    
+    // Add optional workflow metadata
+    if let Some(seq) = sequence {
+        payload["sequence"] = json!(seq);
+    }
+    if let Some(ref rel_id) = related_proof_id {
+        payload["related_proof_id"] = json!(rel_id);
+    }
+    if let Some(ref stage) = inferred_stage {
+        payload["workflow_stage"] = json!(stage);
+    }
+    
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        let error_text = response.text().await?;
+        return Err(anyhow!("Failed to submit proof: {}", error_text));
+    }
+    
+    let result: Value = response.json().await?;
+    
+    if let Some(proof_id) = result.get("proof_id").and_then(|p| p.as_str()) {
+        Ok(proof_id.to_string())
+    } else {
+        Err(anyhow!("Invalid proof submission response"))
     }
 }
