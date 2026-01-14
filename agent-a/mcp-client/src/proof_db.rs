@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use crate::orchestration::RedactionMetadata;
 
 /// Stored proof record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,14 @@ pub struct StoredProof {
     pub related_proof_id: Option<String>, // Reference to parent/related proof (for dependency tracking)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_stage: Option<String>, // e.g., "pricing", "payment_enrollment", "payment", "booking"
+    
+    /// Display version of response with sensitive fields redacted (for UI)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_response: Option<serde_json::Value>,
+    
+    /// Metadata about which fields were redacted and why
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_metadata: Option<RedactionMetadata>,
 }
 
 /// In-memory proof database
@@ -125,6 +134,11 @@ mod tests {
             verified: true,
             onchain_compatible: true,
             submitted_by: Some("agent-a".to_string()),
+            sequence: Some(1),
+            related_proof_id: None,
+            workflow_stage: Some("pricing".to_string()),
+            display_response: None,
+            redaction_metadata: None,
         };
         
         db.store_proof(proof.clone()).await.unwrap();

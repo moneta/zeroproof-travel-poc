@@ -279,6 +279,8 @@ async fn submit_proof(
         sequence: payload.sequence,
         related_proof_id: payload.related_proof_id,
         workflow_stage: payload.workflow_stage,
+        display_response: None,  // Can be populated separately if needed
+        redaction_metadata: None,  // Can be populated separately if needed
     };
     
     match proof_db.store_proof(stored_proof).await {

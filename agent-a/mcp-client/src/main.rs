@@ -298,6 +298,7 @@ fn build_payment_tool_options() -> std::collections::HashMap<String, proxy_fetch
             public_options: Some(json!({"action": "enroll"})),
             private_options: None,
             redactions: Some(payment_redactions.clone()),
+            response_redaction_paths: None,
         },
     );
     
@@ -308,6 +309,7 @@ fn build_payment_tool_options() -> std::collections::HashMap<String, proxy_fetch
             public_options: Some(json!({"action": "purchase"})),
             private_options: None,
             redactions: Some(payment_redactions.clone()),
+            response_redaction_paths: None,
         },
     );
     
@@ -318,6 +320,7 @@ fn build_payment_tool_options() -> std::collections::HashMap<String, proxy_fetch
             public_options: Some(json!({"action": "retrieve"})),
             private_options: None,
             redactions: Some(payment_redactions.clone()),
+            response_redaction_paths: None,
         },
     );
     
@@ -328,6 +331,7 @@ fn build_payment_tool_options() -> std::collections::HashMap<String, proxy_fetch
             public_options: Some(json!({"action": "confirm"})),
             private_options: None,
             redactions: Some(payment_redactions),
+            response_redaction_paths: None,
         },
     );
     

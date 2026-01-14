@@ -53,6 +53,7 @@
 
 use anyhow::{anyhow, Result};
 use reqwest::{Client, RequestBuilder, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -66,8 +67,13 @@ pub struct ZkfetchToolOptions {
     pub private_options: Option<Value>,
 
     /// Fields to exclude from the proof (specified as JSON paths)
-    /// Example: `{"path": "body.card_number"}` to hide the card_number field
+    /// Example: `{"jsonPath": "$.data.card_number"}` to hide the card_number field
     pub redactions: Option<Vec<Value>>,
+
+    /// Sensitive field paths in the response that should be redacted
+    /// Maps field names to their jsonPath in the response structure
+    /// Example: `{"passenger_name": "$.data.passenger_name"}`
+    pub response_redaction_paths: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Default for ZkfetchToolOptions {
@@ -76,6 +82,127 @@ impl Default for ZkfetchToolOptions {
             public_options: None,
             private_options: None,
             redactions: None,
+            response_redaction_paths: None,
+        }
+    }
+}
+
+/// A redaction rule for masking sensitive data in proofs
+///
+/// Redactions use dot-notation paths to identify fields to mask.
+/// Examples:
+/// - `"response.data.passenger_name"` - masks passenger_name in response data
+/// - `"body.card_number"` - masks card_number in request body
+/// - `"request.body.cvv"` - masks CVV in request body
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionRule {
+    /// Dot-notation path to the field to redact (e.g., "body.passenger_name")
+    pub path: String,
+
+    /// Type of redaction: "mask" (****), "hash", "remove"
+    #[serde(default = "default_redaction_type")]
+    pub redaction_type: String,
+}
+
+fn default_redaction_type() -> String {
+    "mask".to_string()
+}
+
+/// Type alias for tool-specific redaction options
+pub type ToolOptionsMap = HashMap<String, ZkfetchToolOptions>;
+
+/// Apply redactions to a JSON value based on a list of redaction rules
+///
+/// Redactions are applied using dot-notation paths. Each redaction
+/// masks the value at the specified path with "****".
+///
+/// # Arguments
+/// * `value` - The JSON value to redact (modified in-place)
+/// * `redactions` - List of redaction rules to apply
+///
+/// # Examples
+/// ```rust,no_run
+/// use serde_json::json;
+///
+/// let mut data = json!({
+///     "name": "John Doe",
+///     "email": "john@example.com"
+/// });
+///
+/// let redactions = vec![
+///     json!({"path": "name"}),
+///     json!({"path": "email"}),
+/// ];
+///
+/// apply_redactions(&mut data, &redactions);
+/// assert_eq!(data["name"], "****");
+/// assert_eq!(data["email"], "****");
+/// ```
+pub fn apply_redactions(value: &mut Value, redactions: &[Value]) {
+    for redaction in redactions {
+        if let Some(path) = redaction.get("path").and_then(|p| p.as_str()) {
+            redact_at_path(value, path);
+        }
+    }
+}
+
+/// Redact a value at a specific dot-notation path
+///
+/// Navigates through nested objects using dot-separated path components
+/// and masks the final value with "****".
+///
+/// # Arguments
+/// * `value` - The root JSON value to navigate
+/// * `path` - Dot-notation path (e.g., "response.data.passenger_name")
+///
+/// # Examples
+/// ```rust,no_run
+/// use serde_json::json;
+///
+/// let mut data = json!({
+///     "response": {
+///         "data": {
+///             "passenger_name": "John Doe",
+///             "booking_id": "BK123"
+///         }
+///     }
+/// });
+///
+/// redact_at_path(&mut data, "response.data.passenger_name");
+/// assert_eq!(data["response"]["data"]["passenger_name"], "****");
+/// assert_eq!(data["response"]["data"]["booking_id"], "BK123");
+/// ```
+pub fn redact_at_path(value: &mut Value, path: &str) {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return;
+    }
+
+    // Navigate to the parent of the target field
+    let mut current = value;
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            // Last component: redact it
+            if let Some(obj) = current.as_object_mut() {
+                if obj.contains_key(*part) {
+                    obj.insert(part.to_string(), json!("****"));
+                }
+            }
+        } else {
+            // Intermediate component: navigate deeper
+            if !current.is_object() {
+                // If we hit a non-object before reaching the end, we can't navigate further
+                return;
+            }
+
+            // Ensure the next level exists and navigate into it
+            let obj = current.as_object_mut().unwrap();
+            if !obj.contains_key(*part) {
+                // Path doesn't exist, can't redact
+                return;
+            }
+
+            current = &mut obj[*part];
         }
     }
 }
@@ -491,6 +618,7 @@ mod tests {
             public_options: Some(json!({"timeout": 20000})),
             private_options: None,
             redactions: Some(vec![json!({"path": "body.sensitive"})]),
+            response_redaction_paths: None,
         };
         tool_options.insert("get-ticket-price".to_string(), options.clone());
 
@@ -510,6 +638,7 @@ mod tests {
             public_options: Some(json!({"timeout": 15000})),
             private_options: None,
             redactions: None,
+            response_redaction_paths: None,
         };
 
         let config = ProxyConfig {
@@ -520,5 +649,115 @@ mod tests {
 
         let resolved = proxy.resolve_tool_options(&Some("unknown-tool".to_string()));
         assert_eq!(resolved.public_options, Some(json!({"timeout": 15000})));
+    }
+
+    #[test]
+    fn test_redact_at_path_simple() {
+        let mut data = json!({
+            "name": "John Doe",
+            "email": "john@example.com",
+            "id": "123"
+        });
+
+        redact_at_path(&mut data, "name");
+        assert_eq!(data["name"], "****");
+        assert_eq!(data["email"], "john@example.com");
+        assert_eq!(data["id"], "123");
+    }
+
+    #[test]
+    fn test_redact_at_path_nested() {
+        let mut data = json!({
+            "response": {
+                "data": {
+                    "passenger_name": "John Doe",
+                    "booking_id": "BK123",
+                    "confirmation_code": "CONF456"
+                }
+            }
+        });
+
+        redact_at_path(&mut data, "response.data.passenger_name");
+        assert_eq!(data["response"]["data"]["passenger_name"], "****");
+        assert_eq!(data["response"]["data"]["booking_id"], "BK123");
+        assert_eq!(data["response"]["data"]["confirmation_code"], "CONF456");
+    }
+
+    #[test]
+    fn test_redact_at_path_nonexistent() {
+        let mut data = json!({
+            "name": "John Doe"
+        });
+
+        // Should not panic, just return gracefully
+        redact_at_path(&mut data, "nonexistent.field.path");
+        assert_eq!(data["name"], "John Doe");
+    }
+
+    #[test]
+    fn test_apply_redactions_multiple() {
+        let mut data = json!({
+            "request": {
+                "body": {
+                    "passenger_name": "John Doe",
+                    "passenger_email": "john@example.com",
+                    "from": "NYC",
+                    "to": "LAX"
+                }
+            },
+            "response": {
+                "data": {
+                    "booking_id": "BK123",
+                    "confirmation_code": "CONF456"
+                }
+            }
+        });
+
+        let redactions = vec![
+            json!({"path": "request.body.passenger_name"}),
+            json!({"path": "request.body.passenger_email"}),
+        ];
+
+        apply_redactions(&mut data, &redactions);
+
+        assert_eq!(data["request"]["body"]["passenger_name"], "****");
+        assert_eq!(data["request"]["body"]["passenger_email"], "****");
+        assert_eq!(data["request"]["body"]["from"], "NYC");
+        assert_eq!(data["request"]["body"]["to"], "LAX");
+        assert_eq!(data["response"]["data"]["booking_id"], "BK123");
+    }
+
+    #[test]
+    fn test_apply_redactions_payment_fields() {
+        // Simulate a payment enrollment proof
+        let mut data = json!({
+            "request": {
+                "body": {
+                    "card_number": "4111111111111111",
+                    "cvv": "123",
+                    "expiry": "12/25",
+                    "card_holder": "John Doe"
+                }
+            },
+            "response": {
+                "tokenId": "token_abc123",
+                "status": "success"
+            }
+        });
+
+        let redactions = vec![
+            json!({"path": "request.body.card_number"}),
+            json!({"path": "request.body.cvv"}),
+            json!({"path": "request.body.expiry"}),
+        ];
+
+        apply_redactions(&mut data, &redactions);
+
+        assert_eq!(data["request"]["body"]["card_number"], "****");
+        assert_eq!(data["request"]["body"]["cvv"], "****");
+        assert_eq!(data["request"]["body"]["expiry"], "****");
+        assert_eq!(data["request"]["body"]["card_holder"], "John Doe");
+        assert_eq!(data["response"]["tokenId"], "token_abc123");
+        assert_eq!(data["response"]["status"], "success");
     }
 }

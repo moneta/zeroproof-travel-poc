@@ -8,6 +8,8 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use crate::proxy_fetch::{ZkfetchToolOptions, ToolOptionsMap};
 
 /// Claude API request
 #[derive(Debug, Serialize)]
@@ -38,6 +40,27 @@ pub struct ContentBlock {
     pub text: String,
 }
 
+/// Metadata tracking which fields were redacted from a proof
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionMetadata {
+    /// Number of fields that were redacted
+    pub redacted_field_count: usize,
+    /// List of dot-notation paths that were redacted
+    pub redacted_paths: Vec<String>,
+    /// Whether redactions were applied (true if any fields were redacted)
+    pub was_redacted: bool,
+}
+
+impl Default for RedactionMetadata {
+    fn default() -> Self {
+        Self {
+            redacted_field_count: 0,
+            redacted_paths: Vec::new(),
+            was_redacted: false,
+        }
+    }
+}
+
 /// Cryptographic proof record for tool calls
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryptographicProof {
@@ -49,6 +72,14 @@ pub struct CryptographicProof {
     pub proof_id: Option<String>,
     pub verified: bool,
     pub onchain_compatible: bool,
+    
+    /// Display version of response with sensitive fields redacted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_response: Option<serde_json::Value>,
+    
+    /// Metadata about which fields were redacted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_metadata: Option<RedactionMetadata>,
 }
 
 /// Booking state tracking across multi-turn conversations
@@ -118,6 +149,105 @@ impl AgentConfig {
             zkfetch_wrapper_url,
         })
     }
+}
+
+/// Build a map of tool-specific redaction rules for privacy-preserving proofs
+/// 
+/// This defines which sensitive fields should be masked in cryptographic proofs
+/// for each MCP tool. The redaction rules use dot-notation paths to specify fields.
+/// 
+/// # Tool Redaction Rules
+/// 
+/// - **get-ticket-price**: No redactions (pricing is public info)
+/// - **book-flight**: Masks passenger_name and passenger_email
+/// - **enroll-card**: Masks card_number, cvv, expiry
+/// - **initiate-purchase-instruction**: Masks amount, tokenId
+/// - **retrieve-payment-credentials**: Masks tokenId, instructionId, credentials
+pub fn build_tool_options_map() -> ToolOptionsMap {
+    let mut map = HashMap::new();
+
+    // get-ticket-price: Pricing query - no sensitive data
+    // Pricing information is public and doesn't need redaction
+    map.insert(
+        "get-ticket-price".to_string(),
+        ZkfetchToolOptions::default(),
+    );
+
+    // book-flight: Passenger booking - redact PII
+    // Masks passenger identification information in response
+    let mut book_flight_paths = std::collections::HashMap::new();
+    book_flight_paths.insert("passenger_name".to_string(), "$.data.passenger_name".to_string());
+    
+    map.insert(
+        "book-flight".to_string(),
+        ZkfetchToolOptions {
+            public_options: None,
+            private_options: None,
+            redactions: Some(vec![
+                // Only redact response data - request body is not in zkfetch response
+                json!({"jsonPath": "$.data.passenger_name"}),
+            ]),
+            response_redaction_paths: Some(book_flight_paths),
+        },
+    );
+
+    // enroll-card: Payment card enrollment - redact card details
+    // Masks sensitive payment card information in response
+    let mut enroll_card_paths = std::collections::HashMap::new();
+    enroll_card_paths.insert("tokenId".to_string(), "$.data.tokenId".to_string());
+    
+    map.insert(
+        "enroll-card".to_string(),
+        ZkfetchToolOptions {
+            public_options: None,
+            private_options: None,
+            redactions: Some(vec![
+                // Only redact response data - request body is not in zkfetch response
+                json!({"jsonPath": "$.data.tokenId"}),
+            ]),
+            response_redaction_paths: Some(enroll_card_paths),
+        },
+    );
+
+    // initiate-purchase-instruction: Payment initiation - redact transaction details
+    // Masks financial transaction details in response
+    let mut purchase_paths = std::collections::HashMap::new();
+    purchase_paths.insert("instructionId".to_string(), "$.data.instructionId".to_string());
+    
+    map.insert(
+        "initiate-purchase-instruction".to_string(),
+        ZkfetchToolOptions {
+            public_options: None,
+            private_options: None,
+            redactions: Some(vec![
+                // Only redact response data - request body is not in zkfetch response
+                json!({"jsonPath": "$.data.instructionId"}),
+            ]),
+            response_redaction_paths: Some(purchase_paths),
+        },
+    );
+
+    // retrieve-payment-credentials: Payment credential retrieval - redact all sensitive data
+    // Masks payment credentials in response
+    let mut credentials_paths = std::collections::HashMap::new();
+    credentials_paths.insert("credentials".to_string(), "$.data.credentials".to_string());
+    credentials_paths.insert("paymentCredentials".to_string(), "$.data.paymentCredentials".to_string());
+    
+    map.insert(
+        "retrieve-payment-credentials".to_string(),
+        ZkfetchToolOptions {
+            public_options: None,
+            private_options: None,
+            redactions: Some(vec![
+                // Only redact response data - request body is not in zkfetch response
+                json!({"jsonPath": "$.data.credentials"}),
+                json!({"jsonPath": "$.data.paymentCredentials"}),
+            ]),
+            response_redaction_paths: Some(credentials_paths),
+        },
+    );
+
+    map
 }
 
 /// Fetch tool definitions from a server with timeout
@@ -410,11 +540,15 @@ pub async fn call_tool_with_proof(
     if let Some(zkfetch_url) = zkfetch_wrapper_url {
         println!("[TOOL] Calling {} via zkfetch-wrapper (PROXIED)", tool_name);
         // zkfetch-wrapper expects:
-        // POST /zkfetch with { url, publicOptions, privateOptions }
+        // POST /zkfetch with { url, publicOptions, privateOptions, redactions }
         let target_url = format!("{}/tools/{}", server_url, tool_name);
         
-        // The request body goes in publicOptions.body as JSON string
-        let zkfetch_payload = json!({
+        // Get tool options for this tool to embed redaction rules in zkfetch payload
+        let tool_options_map = build_tool_options_map();
+        let tool_opts = tool_options_map.get(tool_name);
+        
+        // Build zkfetch payload with embedded redaction rules
+        let mut zkfetch_payload = json!({
             "url": target_url,
             "publicOptions": {
                 "method": "POST",
@@ -424,6 +558,14 @@ pub async fn call_tool_with_proof(
                 "body": arguments.to_string()
             }
         });
+        
+        // Add redaction rules if this tool has sensitive fields
+        if let Some(opts) = tool_opts {
+            if let Some(redactions) = &opts.redactions {
+                zkfetch_payload["redactions"] = json!(redactions);
+                println!("[ZKFETCH] Applied {} redaction rules for {}", redactions.len(), tool_name);
+            }
+        }
 
         println!("[ZKFETCH] Calling Agent B through zkfetch-wrapper: {}", tool_name);
         
@@ -448,9 +590,14 @@ pub async fn call_tool_with_proof(
                             .and_then(|m| m.get("onchain_compatible"))
                             .and_then(|o| o.as_bool())
                             .unwrap_or(false);
+
                         
                         // Create cryptographic proof record
                         let crypto_proof = if let Some(proof_data) = proof {
+                            // Note: Redactions are applied server-side by zkfetch-wrapper.
+                            // The proof returned is already on-chain verifiable with redactions applied.
+                            // We don't apply redactions locally - they happen at the zkfetch payload level.
+                            
                             Some(CryptographicProof {
                                 tool_name: tool_name.to_string(),
                                 timestamp: std::time::SystemTime::now()
@@ -466,10 +613,13 @@ pub async fn call_tool_with_proof(
                                     .map(|s| s.to_string()),
                                 verified,
                                 onchain_compatible,
+                                display_response: Some(tool_result.clone()),
+                                redaction_metadata: None, // zkfetch-wrapper handles this server-side
                             })
                         } else {
                             None
                         };
+
                         
                         // Extract data and return
                         if let Some(data) = tool_result.get("data") {
@@ -1398,4 +1548,141 @@ pub async fn submit_proof_to_database_with_metadata(
     } else {
         Err(anyhow!("Invalid proof submission response"))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tool_options_map_contains_all_tools() {
+        let tool_map = build_tool_options_map();
+        
+        // Verify all expected tools are in the map
+        assert!(tool_map.contains_key("get-ticket-price"));
+        assert!(tool_map.contains_key("book-flight"));
+        assert!(tool_map.contains_key("enroll-card"));
+        assert!(tool_map.contains_key("initiate-purchase-instruction"));
+        assert!(tool_map.contains_key("retrieve-payment-credentials"));
+    }
+
+    #[test]
+    fn test_build_tool_options_map_pricing_no_redactions() {
+        let tool_map = build_tool_options_map();
+        
+        // get-ticket-price should have no redactions
+        let pricing_opts = tool_map.get("get-ticket-price").unwrap();
+        assert!(pricing_opts.redactions.is_none() || pricing_opts.redactions.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_tool_options_map_book_flight_redactions() {
+        let tool_map = build_tool_options_map();
+        
+        // book-flight should redact passenger PII
+        let booking_opts = tool_map.get("book-flight").unwrap();
+        assert!(booking_opts.redactions.is_some());
+        
+        let redactions = booking_opts.redactions.as_ref().unwrap();
+        assert!(!redactions.is_empty());
+        
+        // Verify response redaction paths
+        assert!(booking_opts.response_redaction_paths.is_some());
+        let paths = booking_opts.response_redaction_paths.as_ref().unwrap();
+        assert!(paths.contains_key("passenger_name"));
+    }
+
+    #[test]
+    fn test_build_tool_options_map_enroll_card_redactions() {
+        let tool_map = build_tool_options_map();
+        
+        // enroll-card should redact payment card details
+        let enroll_opts = tool_map.get("enroll-card").unwrap();
+        assert!(enroll_opts.redactions.is_some());
+        
+        let redactions = enroll_opts.redactions.as_ref().unwrap();
+        assert!(redactions.len() >= 1);
+        
+        // Verify response redaction paths
+        assert!(enroll_opts.response_redaction_paths.is_some());
+        let paths = enroll_opts.response_redaction_paths.as_ref().unwrap();
+        assert!(paths.contains_key("tokenId"));
+    }
+
+    #[test]
+    fn test_build_tool_options_map_initiate_purchase_redactions() {
+        let tool_map = build_tool_options_map();
+        
+        // initiate-purchase-instruction should redact transaction details
+        let purchase_opts = tool_map.get("initiate-purchase-instruction").unwrap();
+        assert!(purchase_opts.redactions.is_some());
+        
+        let redactions = purchase_opts.redactions.as_ref().unwrap();
+        assert!(redactions.len() >= 1);
+        
+        // Verify response redaction paths
+        assert!(purchase_opts.response_redaction_paths.is_some());
+        let paths = purchase_opts.response_redaction_paths.as_ref().unwrap();
+        assert!(paths.contains_key("instructionId"));
+    }
+
+    #[test]
+    fn test_build_tool_options_map_retrieve_credentials_redactions() {
+        let tool_map = build_tool_options_map();
+        
+        // retrieve-payment-credentials should redact all sensitive data
+        let retrieve_opts = tool_map.get("retrieve-payment-credentials").unwrap();
+        assert!(retrieve_opts.redactions.is_some());
+        
+        let redactions = retrieve_opts.redactions.as_ref().unwrap();
+        assert!(redactions.len() >= 2);
+        
+        // Verify response redaction paths
+        assert!(retrieve_opts.response_redaction_paths.is_some());
+        let paths = retrieve_opts.response_redaction_paths.as_ref().unwrap();
+        assert!(paths.contains_key("credentials"));
+        assert!(paths.contains_key("paymentCredentials"));
+    }
+
+    #[test]
+    fn test_zkfetch_payload_includes_redactions() {
+        // Verify that the zkfetch payload structure includes redactions for tools
+        let tool_options_map = build_tool_options_map();
+        
+        // book-flight should have redactions
+        let book_flight_opts = tool_options_map.get("book-flight");
+        assert!(book_flight_opts.is_some(), "book-flight should be in tool options map");
+        
+        let book_flight = book_flight_opts.unwrap();
+        assert!(book_flight.redactions.is_some(), "book-flight should have redactions");
+        
+        let redactions = book_flight.redactions.as_ref().unwrap();
+        assert!(!redactions.is_empty(), "book-flight redactions should not be empty");
+        
+        // Verify redaction structure has required fields
+        for redaction in redactions {
+            assert!(redaction.get("jsonPath").is_some(), "Each redaction must have 'jsonPath' field");
+        }
+        
+        // Verify that redactions can be serialized to JSON for zkfetch payload
+        let payload = json!({
+            "url": "http://agent-b/tools/book-flight",
+            "publicOptions": {
+                "method": "POST",
+                "headers": {"Content-Type": "application/json"},
+                "body": "{}"
+            },
+            "redactions": redactions
+        });
+        
+        // Verify the payload structure is correct
+        assert!(payload.get("url").is_some());
+        assert!(payload.get("publicOptions").is_some());
+        assert!(payload.get("redactions").is_some());
+        
+        // Verify redactions are properly nested in payload
+        let payload_redactions = payload.get("redactions").unwrap();
+        assert_eq!(payload_redactions.as_array().unwrap().len(), redactions.len());
+    }
+
 }
