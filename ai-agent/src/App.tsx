@@ -57,9 +57,12 @@ const ChatInterface: React.FC = () => {
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
 
   // Hardcoded backend URL for now - point to Agent A HTTP Server
-  const backendApiUrl = 'http://localhost:3001/chat';
-  const proofsApiUrl = 'http://localhost:3001/proofs';
-  const verifyProofUrl = 'http://localhost:3001/proofs/verify';
+  // const backendApiUrl = 'http://localhost:3001/chat';
+  // const proofsApiUrl = 'http://localhost:3001/proofs';
+  // const verifyProofUrl = 'http://localhost:3001/proofs/verify';
+  const backendApiUrl = 'https://dev.agenta.zeroproofai.com/chat';
+  const proofsApiUrl = 'https://dev.agenta.zeroproofai.com/proofs';
+  const verifyProofUrl = 'https://dev.agenta.zeroproofai.com/proofs/verify';
 
   // Auto-scroll to bottom when messages change
   const scrollToBottom = () => {
@@ -76,11 +79,10 @@ const ChatInterface: React.FC = () => {
     setSessionId(newSessionId);
   }, []);
 
-  // Fetch proofs periodically or on demand - only updates if data changed
-  const fetchProofs = useCallback(async () => {
+  // Fetch proofs automatically (for polling) - no loading state to avoid blinking
+  const fetchProofsAutomatically = useCallback(async () => {
     if (!sessionId) return;
     
-    setProofLoading(true);
     try {
       const response = await axios.get(`${proofsApiUrl}/${sessionId}`);
       if (response.data.success) {
@@ -106,6 +108,21 @@ const ChatInterface: React.FC = () => {
       }
     } catch (error) {
       console.error('Error fetching proofs:', error);
+    }
+  }, [sessionId, proofsApiUrl]);
+
+  // Fetch proofs manually (for manual refresh button) - shows loading state
+  const fetchProofs = useCallback(async () => {
+    if (!sessionId) return;
+    
+    setProofLoading(true);
+    try {
+      const response = await axios.get(`${proofsApiUrl}/${sessionId}`);
+      if (response.data.success) {
+        setProofs(response.data.proofs);
+      }
+    } catch (error) {
+      console.error('Error fetching proofs:', error);
     } finally {
       setProofLoading(false);
     }
@@ -128,13 +145,13 @@ const ChatInterface: React.FC = () => {
     }
   }, [verifyProofUrl]);
 
-  // Poll for proofs every 2 seconds when showing proofs
+  // Poll for proofs every 2 seconds when showing proofs (using automatic fetch, no loading state)
   React.useEffect(() => {
     if (!showProofs) return;
 
-    const interval = setInterval(fetchProofs, 2000);
+    const interval = setInterval(fetchProofsAutomatically, 2000);
     return () => clearInterval(interval);
-  }, [showProofs, fetchProofs]);
+  }, [showProofs, fetchProofsAutomatically]);
 
   const handleSendMessage = async () => {
     if (!input.trim()) return;
@@ -157,7 +174,7 @@ const ChatInterface: React.FC = () => {
       setMessages((prev) => [...prev, assistantMessage]);
       
       // Fetch proofs after message is processed
-      setTimeout(fetchProofs, 500);
+      setTimeout(fetchProofsAutomatically, 500);
     } catch (error) {
       console.error('Error sending message:', error);
       const errorMessage: ChatMessage = {

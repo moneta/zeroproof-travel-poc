@@ -432,6 +432,7 @@ impl ProxyFetch {
         // Extract hidden parameters and convert to paramValues
         let mut final_body = body.unwrap_or(Value::Null);
         let mut private_options = zk_options.private_options.clone().unwrap_or_else(|| json!({}));
+        let mut final_url = url.to_string();
         
         // Parse body if it's a string (likely from JSON serialization)
         if let Value::String(body_str) = &final_body {
@@ -440,35 +441,78 @@ impl ProxyFetch {
             }
         }
         
-        // Extract hidden parameters
-        if let Some(body_obj) = final_body.as_object_mut() {
-            if let Some(private_opts) = private_options.as_object_mut() {
-                if let Some(Value::Array(hidden_params)) = private_opts.get("hiddenParameters") {
-                    let hidden_params = hidden_params.clone();
-                    let mut param_values = serde_json::Map::new();
-                    
+        // Extract hidden parameters from body and URL
+        let mut param_values_map = serde_json::Map::new();
+        
+        if let Some(private_opts) = private_options.as_object_mut() {
+            if let Some(Value::Array(hidden_params)) = private_opts.get("hiddenParameters") {
+                let hidden_params = hidden_params.clone();
+                
+                // Extract from request body
+                if let Some(body_obj) = final_body.as_object_mut() {
                     for param in hidden_params.iter() {
                         if let Value::String(param_name) = param {
                             if let Some(value) = body_obj.remove(param_name) {
-                                param_values.insert(param_name.clone(), value);
+                                param_values_map.insert(param_name.clone(), value);
                                 let placeholder = format!("{{{{{}}}}}", param_name);
                                 body_obj.insert(param_name.clone(), Value::String(placeholder));
                             }
                         }
                     }
+                }
+                
+                // Extract from URL query parameters
+                if let Some(query_start) = final_url.find('?') {
+                    let (base_url, query_string) = final_url.split_at(query_start);
+                    let query_string = &query_string[1..]; // Skip the '?'
                     
-                    if !param_values.is_empty() {
-                        private_opts.insert("paramValues".to_string(), Value::Object(param_values));
-                        private_opts.remove("hideRequestBody");
-                        private_opts.remove("hiddenParameters");
+                    let mut new_query_params = Vec::new();
+                    let mut url_modified = false;
+                    
+                    for param_pair in query_string.split('&') {
+                        if let Some((key, value)) = param_pair.split_once('=') {
+                            // Check if this parameter is in hidden list
+                            let is_hidden = hidden_params.iter().any(|p| {
+                                if let Value::String(param_name) = p {
+                                    param_name == key
+                                } else {
+                                    false
+                                }
+                            });
+                            
+                            if is_hidden {
+                                // Decode the URL-encoded value
+                                if let Ok(decoded_value) = urlencoding::decode(value) {
+                                    param_values_map.insert(key.to_string(), Value::String(decoded_value.into_owned()));
+                                    new_query_params.push(format!("{}={{{{{}}}}}", key, key));
+                                    url_modified = true;
+                                } else {
+                                    new_query_params.push(param_pair.to_string());
+                                }
+                            } else {
+                                new_query_params.push(param_pair.to_string());
+                            }
+                        } else {
+                            new_query_params.push(param_pair.to_string());
+                        }
                     }
+                    
+                    if url_modified {
+                        final_url = format!("{}?{}", base_url, new_query_params.join("&"));
+                    }
+                }
+                
+                if !param_values_map.is_empty() {
+                    private_opts.insert("paramValues".to_string(), Value::Object(param_values_map));
+                    private_opts.remove("hideRequestBody");
+                    private_opts.remove("hiddenParameters");
                 }
             }
         }
 
         // Build zkfetch payload
         let zkfetch_payload = json!({
-            "url": url,
+            "url": final_url,
             "publicOptions": {
                 "method": method,
                 "headers": {"Content-Type": "application/json"},
@@ -484,7 +528,7 @@ impl ProxyFetch {
 
         if self.config.debug {
             tracing::info!("📦 Final zkfetch payload structure:");
-            tracing::info!("  URL: {}", url);
+            tracing::info!("  URL: {}", final_url);
             tracing::info!("  Method: {}", method);
             tracing::info!("  Public body: {}", zkfetch_payload.get("publicOptions").and_then(|o| o.get("body")).map(|b| b.to_string()).unwrap_or_default());
             
