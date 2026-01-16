@@ -1,14 +1,15 @@
 /// HTTP Server wrapper for Agent A MCP Client
-/// Exposes the orchestration logic as REST API endpoints
-/// Allows web interfaces to interact with the agent
+/// Exposes the orchestration logic as REST API endpoints and WebSocket connections
+/// Allows web interfaces to interact with the agent in real-time
 
 use axum::{
-    extract::{Json, Path},
+    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, Json, Path},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -225,6 +226,144 @@ async fn chat(
     }
 }
 
+/// WebSocket chat endpoint for real-time conversation
+async fn websocket_chat(
+    ws: WebSocketUpgrade,
+    axum::extract::Extension(sessions): axum::extract::Extension<SessionManager>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket(socket, sessions))
+}
+
+/// Handle WebSocket connection for real-time chat
+async fn handle_websocket(socket: WebSocket, sessions: SessionManager) {
+    println!("[WEBSOCKET] New connection established");
+
+    let (mut sender, mut receiver) = socket.split();
+    let mut session_id: Option<String> = None;
+
+    // Initialize config once for this connection
+    let config = match AgentConfig::from_env() {
+        Ok(cfg) => {
+            println!("[WEBSOCKET] Configuration loaded successfully");
+            cfg
+        }
+        Err(e) => {
+            println!("[WEBSOCKET] Configuration failed: {}", e);
+            let error_msg = serde_json::json!({
+                "success": false,
+                "error": format!("Configuration error: {}", e),
+                "session_id": null
+            });
+            let _ = sender.send(Message::Text(error_msg.to_string())).await;
+            return;
+        }
+    };
+
+    // Message handling loop
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                println!("[WEBSOCKET] Received message: {}", text);
+                
+                // Parse incoming message
+                let chat_request: Result<ChatRequest, _> = serde_json::from_str(&text);
+                match chat_request {
+                    Ok(payload) => {
+                        // SECURITY: Server generates session ID, never trusts client-provided ones
+                        let session_id_for_processing = if let Some(established_session) = &session_id {
+                            // Use established session ID for this connection
+                            established_session.clone()
+                        } else {
+                            // First message - server generates new session ID (ignore client-provided)
+                            let server_generated_session_id = format!("ws_sess_{}", uuid::Uuid::new_v4());
+                            session_id = Some(server_generated_session_id.clone());
+                            println!("[WEBSOCKET] Server generated new session: {}", server_generated_session_id);
+                            server_generated_session_id
+                        };
+
+                        println!("[WEBSOCKET] Processing message for session: {}", session_id_for_processing);
+                        // Lock session manager and get/create session data
+                        let mut sessions_lock = sessions.lock().await;
+                        let mut session = sessions_lock
+                            .get(&session_id_for_processing)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        println!("[WEBSOCKET] Retrieved session - State: {}, Messages: {}",
+                                 session.state.step, session.messages.len());
+                        
+                        // Process the user query
+                        match process_user_query(&config, &payload.message, &session.messages, &mut session.state, &session_id_for_processing).await {
+                            Ok((response, updated_messages, updated_state)) => {
+                                // Update session with new messages and state
+                                let message_count = updated_messages.len();
+                                session.messages = updated_messages;
+                                session.state = updated_state.clone();
+                                sessions_lock.insert(session_id_for_processing.clone(), session);
+                                
+                                println!("[WEBSOCKET] Request processed - SessionID: {}, New state: {}, Messages: {}",
+                                         session_id_for_processing, updated_state.step, message_count);
+                                
+                                // Send response back through WebSocket
+                                let response_msg = serde_json::json!({
+                                    "success": true,
+                                    "response": response,
+                                    "session_id": session_id_for_processing
+                                });
+
+                                if let Err(e) = sender.send(Message::Text(response_msg.to_string())).await {
+                                    println!("[WEBSOCKET] Error sending response: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                println!("[WEBSOCKET] Processing failed - SessionID: {}, Error: {}", session_id_for_processing, e);
+                                
+                                let error_msg = serde_json::json!({
+                                    "success": false,
+                                    "error": format!("Error processing request: {}", e),
+                                    "session_id": session_id_for_processing
+                                });
+
+                                if let Err(e) = sender.send(Message::Text(error_msg.to_string())).await {
+                                    println!("[WEBSOCKET] Error sending error response: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[WEBSOCKET] Failed to parse message: {}", e);
+                        let error_msg = serde_json::json!({
+                            "success": false,
+                            "error": format!("Invalid message format: {}", e),
+                            "session_id": session_id
+                        });
+
+                        if let Err(e) = sender.send(Message::Text(error_msg.to_string())).await {
+                            println!("[WEBSOCKET] Error sending parse error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                println!("[WEBSOCKET] Connection closed by client");
+                break;
+            }
+            Ok(_) => {
+                // Ignore other message types (ping, pong, binary, etc.)
+            }
+            Err(e) => {
+                println!("[WEBSOCKET] WebSocket error: {}", e);
+                break;
+            }
+        }
+    }
+
+    println!("[WEBSOCKET] Connection ended");
+}
+
 /// Submit a cryptographic proof - proxy to zk-attestation-service
 async fn submit_proof(
     Json(payload): Json<ProofSubmissionRequest>,
@@ -437,7 +576,7 @@ async fn main() {
 
     println!("\n╔════════════════════════════════════════════════════════════╗");
     println!("║     Agent A - HTTP API Server (Claude-powered Agent)       ║");
-    println!("║    With Session-based Conversation Management              ║");
+    println!("║   With Session-based Conversation & WebSocket Support      ║");
     println!("║   And Distributed Proof Collection Infrastructure          ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
@@ -479,6 +618,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/chat", post(chat))
+        .route("/ws/chat", get(websocket_chat))
         .route("/proofs", post(submit_proof))
         .route("/proofs/verify/:proof_id", get(get_proof_by_id))  // Most specific first
         .route("/proofs/:session_id/count", get(get_proof_count)) // Second most specific
@@ -491,14 +631,16 @@ async fn main() {
         .await
         .expect("Failed to bind listener");
 
-    println!("[STARTUP] ✓ Agent A HTTP Server running on http://0.0.0.0:{}", port);
-    println!("  POST /chat                      — Send a message (session-based conversation)");
+    println!("[STARTUP] ✓ Agent A HTTP/WebSocket Server running on http://0.0.0.0:{}", port);
+    println!("  POST /chat                      — Send a message (HTTP REST API)");
+    println!("  GET  /ws/chat                   — WebSocket chat endpoint (real-time)");
     println!("  POST /proofs                    — Submit a cryptographic proof");
     println!("  GET  /proofs/:session_id        — Get all proofs for session (with full ZK-TLS data)");
     println!("  GET  /proofs/:session_id/count  — Get proof count for session");
     println!("  GET  /proofs/verify/:proof_id   — Get proof by ID (optimized for on-chain verification)");
     println!("  GET  /health                    — Check server health");
-    println!("\n✅ Proof Verification - Any agent can independently verify proofs against Reclaim smart contract");
+    println!("\n✅ WebSocket enabled - clients can connect to ws://localhost:{}/ws/chat for real-time chat", port);
+    println!("✅ Proof Verification - Any agent can independently verify proofs against Reclaim smart contract");
     println!("✅ Full proof data includes: ZK-TLS proof, request/response, workflow metadata\n");
 
     // Run server
